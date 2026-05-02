@@ -1,0 +1,15 @@
+---
+const API_BASE = import.meta.env.PUBLIC_API_BASE ?? 'http://localhost:8787';
+---
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{project-name}}</title>
+</head>
+<body>
+  <h1>{{project-name}}</h1>
+  <p>API: {API_BASE}</p>
+</body>
+</html>

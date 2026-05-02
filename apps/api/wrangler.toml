@@ -1,0 +1,19 @@
+name = "{{project-name}}-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "{{project-name}}-db"
+database_id = "REPLACE_AFTER_wrangler_d1_create"
+migrations_dir = "../../migrations"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# 필요 시 cron 추가
+# [triggers]
+# crons = ["0 12 * * 3", "0 12 * * 6", "0 12 * * 7"]
+# 주의: Cloudflare cron은 요일 0(일요일) 미지원 → 7 사용

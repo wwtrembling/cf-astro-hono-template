@@ -1,0 +1,7 @@
+-- 스키마를 여기에 추가하세요
+-- 예시:
+-- CREATE TABLE IF NOT EXISTS items (
+--   id INTEGER PRIMARY KEY AUTOINCREMENT,
+--   name TEXT NOT NULL,
+--   created_at TEXT DEFAULT (datetime('now'))
+-- );

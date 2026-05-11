@@ -3,6 +3,7 @@
 - 필요할 경우 ci-gateway hooking 기능 추가
 
 # Cloudflare 알려진 주의사항
+- Wrangler는 Node.js v22 이상 필요 (CI에서 node-version: 22 사용)
 - cron 요일: 0(일요일) 미지원 → `7` 사용
 - Pages 최초 배포: `wrangler pages project create` 필요 (deploy.yml에 포함됨)
 - API URL: 계정 서브도메인 포함 필수 → `{name}.{account}.workers.dev`

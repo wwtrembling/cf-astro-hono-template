@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>워로드 PoC</title>
+<style>
+  html,body{height:100%}
+  body{margin:0;background:#070b16;overflow:hidden;-webkit-user-select:none;user-select:none;
+    font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic','Segoe UI',sans-serif}
+  #wrap{height:100dvh;display:flex;align-items:center;justify-content:center}
+  #game{display:block;touch-action:none;width:min(100vw,56.25dvh);aspect-ratio:9/16;
+    background:#131e36;border-radius:6px}
+</style>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+'use strict';
+// ───────────────────────── 워로드 PoC ─────────────────────────
+// 스무 살 청년이 인생이라는 다리를 달린다. 거리 = 나이.
+// 조작: 드래그(또는 ←→) 하나. 발사는 자동. 죽으면 아이가 잇는다.
+
+const W = 360, H = 640;
+const ROAD_L = 50, ROAD_R = 310;          // 도로 좌우 경계
+const LEADER_Y = 540;                     // 본체 y 고정
+
+// 밸런스 (PoC 튜닝 포인트)
+const BAL = {
+  yearsPerSec: 0.38,      // 초당 나이(년) — 20→27세 약 18초
+  scrollBase: 150,        // 기본 스크롤 속도(px/s)
+  fireInterval: 0.38,     // 일제사격 간격(초)
+  missileSpeed: 540,
+  crowdCap: 24,           // 분신 최대
+  lifespan: 80,           // 수명 — 도달 시 자동 세대 교체
+  barrelEvery: [1.7, 0.9],// 배럴 스폰 간격 [초기, 최소]
+  runnerEvery: 2.3,
+  gateEvery: 6.5,
+};
+
+// 인생 타임라인 보스 (매 세대 반복, 세대가 오를수록 강해짐)
+const BOSSES = [
+  { age: 27, name: '취업',        hp: 90,  reward: 'employ' },
+  { age: 31, name: '결혼',        hp: 150, reward: 'marry'  },
+  { age: 33, name: '대리진급',    hp: 210, reward: 'promo'  },
+  { age: 34, name: '출산',        hp: 260, reward: 'baby'   },
+  { age: 38, name: '과장진급',    hp: 350, reward: 'promo'  },
+  { age: 39, name: '둘째 출산',   hp: 400, reward: 'baby'   },
+  { age: 45, name: '차장진급',    hp: 540, reward: 'promo'  },
+  { age: 52, name: '부장진급',    hp: 700, reward: 'promo2' },
+  { age: 58, name: '자영업 vs 임원', hp: 1000, reward: 'final' },
+];
+
+// 배럴에 붙는 인생 장애물 라벨 (뒤로 갈수록 무거워짐)
+const LIFE = ['월요일','알람','지각','과제','시험','월세','학자금','야근','회식','상사',
+  '카드값','보고서','대출','민원','감사','허리디스크','사교육','부동산','입시','건강검진'];
+
+const cv = document.getElementById('game');
+const cx = cv.getContext('2d');
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+cv.width = W * DPR; cv.height = H * DPR;
+cx.scale(DPR, DPR);
+
+const FONT = "-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif";
+const MONO = "ui-monospace,'SF Mono',Consolas,monospace";
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// 분신 대형 오프셋 (뒤로 3-4-5-6-6열)
+const FORM = [];
+{
+  const rows = [3, 4, 5, 6, 6];
+  let i = 0;
+  for (let r = 0; r < rows.length && i < BAL.crowdCap; r++)
+    for (let c = 0; c < rows[r] && i < BAL.crowdCap; c++, i++)
+      FORM.push({ x: (c - (rows[r] - 1) / 2) * 24 + rnd(-2, 2), y: 26 + r * 21 + rnd(-2, 2) });
+}
+
+// ───────────────────────── 상태 ─────────────────────────
+let S;
+function resetAll() {
+  S = {
+    mode: 'play',            // play | boss | over
+    age: 20, gen: 1, chronicle: 0,
+    crowd: 0, babies: 0, kidsGrown: false,
+    hasGF: false, isWife: false, gfSpawned: false,
+    dmg: 1, fireInt: BAL.fireInterval,
+    leaderX: W / 2, targetX: W / 2, invuln: 2,
+    bossIdx: 0, boss: null,
+    scroll: 0, shake: 0, fireT: 0, gfFireT: 0, babyFireT: 0, bossSpitT: 0,
+    barrelT: 1.2, runnerT: 2.0, gateT: 3.5,
+    missiles: [], mobs: [], gates: [], parts: [], labels: [],
+    banner: null, overT: 0, hintT: 8,
+  };
+}
+let best = 0;
+try { best = Number(localStorage.getItem('warlord-poc-best') || 0) || 0; } catch (e) {}
+
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (e.key.startsWith('Arrow')) e.preventDefault();
+  keys.add(e.key);
+  if (S.mode === 'over' && S.overT > 0.8) resetAll();
+});
+addEventListener('keyup', e => keys.delete(e.key));
+const toX = cxl => { const r = cv.getBoundingClientRect(); return (cxl - r.left) / r.width * W; };
+let drag = false;
+cv.addEventListener('pointerdown', e => {
+  if (S.mode === 'over') { if (S.overT > 0.8) resetAll(); return; }
+  drag = true; S.targetX = toX(e.clientX);
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e => { if (drag) S.targetX = toX(e.clientX); });
+cv.addEventListener('pointerup', () => drag = false);
+cv.addEventListener('pointercancel', () => drag = false);
+
+// ───────────────────────── 유틸 ─────────────────────────
+const threat = () => (S.age - 20) + (S.gen - 1) * 12;
+const scrollSpd = () => Math.min(270, BAL.scrollBase + threat() * 2.2);
+const unitCount = () => 1 + S.crowd + (S.hasGF ? 1 : 0) + S.babies;
+
+function banner(t, sub) { S.banner = { t, sub, life: 2.0 }; }
+function label(x, y, text, color) { S.labels.push({ x, y, text, color, life: 1.0 }); }
+function boom(x, y, color, n) {
+  for (let i = 0; i < n; i++)
+    S.parts.push({ x, y, vx: rnd(-140, 140), vy: rnd(-140, 140), life: rnd(.3, .6), max: .6, color, r: rnd(1.5, 3.5) });
+  if (S.parts.length > 320) S.parts.splice(0, S.parts.length - 320);
+}
+
+// ───────────────────────── 스폰 ─────────────────────────
+function spawnBarrel() {
+  const hp = Math.round(6 + threat() * 1.3 + rnd(0, 10));
+  const li = clamp(Math.floor(threat() / 42 * LIFE.length + rnd(-2, 3)), 0, LIFE.length - 1);
+  S.mobs.push({ kind: 'barrel', x: rnd(ROAD_L + 26, ROAD_R - 26), y: -30, r: 22,
+    hp, max: hp, word: LIFE[li], vy: scrollSpd() * .55 });
+}
+function spawnRunners() {
+  const n = 2 + Math.floor(rnd(0, 2.6));
+  const bx = rnd(ROAD_L + 30, ROAD_R - 30);
+  for (let i = 0; i < n; i++)
+    S.mobs.push({ kind: 'runner', x: clamp(bx + rnd(-34, 34), ROAD_L + 12, ROAD_R - 12),
+      y: -20 - rnd(0, 50), r: 11, hp: Math.max(1, Math.round(1 + threat() * .16)), max: 3,
+      vy: scrollSpd() * .8 + rnd(10, 50) });
+}
+function spawnGate() {
+  const plus = { v: Math.round(rnd(2, 4 + threat() * .12)), neg: false };
+  const minus = { v: -Math.round(rnd(2, 5 + threat() * .15)), neg: true };
+  const flip = Math.random() < .5;
+  S.gates.push({ y: -30, left: flip ? plus : minus, right: flip ? minus : plus });
+}
+function spawnCapsule() {
+  S.mobs.push({ kind: 'capsule', x: rnd(ROAD_L + 40, ROAD_R - 40), y: -30, r: 20, hp: 1e9, vy: scrollSpd() * .5 });
+  S.gfSpawned = true;
+}
+function startBoss(b) {
+  S.mode = 'boss';
+  const hp = Math.round(b.hp * (1 + .3 * (S.gen - 1)));
+  S.boss = { ...b, x: W / 2, y: 90, r: 40 + Math.min(18, S.bossIdx * 3), hp, maxHp: hp, vx: 60, sink: 8 };
+  banner(`보스 — ${b.name}`, b.reward === 'final' ? '인생 최종 관문' : `${b.age}세의 관문`);
+}
+
+// ───────────────────────── 보상/계승 ─────────────────────────
+function reward(b) {
+  switch (b.reward) {
+    case 'employ': S.fireInt *= .78; banner('취업 성공!', '사원증 획득 — 발사 속도 UP'); break;
+    case 'marry':
+      if (S.hasGF) { S.isWife = true; banner('결혼!', '아내가 되어 강해졌다'); }
+      else { S.hasGF = true; S.isWife = true; banner('소개팅 성공 → 결혼!', '아내 합류'); }
+      break;
+    case 'promo': S.dmg += .6; banner(`${b.name}!`, '공격력 UP'); break;
+    case 'baby': S.babies = Math.min(3, S.babies + 1); banner('아기 탄생!', '유모차 포탑 합류 · 남은 목숨 +1'); break;
+    case 'promo2': S.dmg += 1; S.kidsGrown = true; banner('부장 진급!', '아이들이 다 컸다 — 함께 싸운다'); break;
+    case 'final': S.dmg += 1.5; banner('전설 달성!', '가문의 이름을 새겼다 — 끝까지 달려라'); break;
+  }
+  S.crowd = Math.min(BAL.crowdCap, S.crowd + 2);
+}
+function leaderHit() {
+  if (S.invuln > 0) return;
+  S.shake = 9; boom(S.leaderX, LEADER_Y, '#4a7de6', 26);
+  if (S.babies > 0) {           // 계승: 아이가 잇는다
+    S.babies--; S.gen++; S.chronicle += Math.floor(S.age);
+    S.age = 20; S.bossIdx = 0; S.boss = null; S.mode = 'play';
+    S.crowd = 2; S.hasGF = false; S.isWife = false; S.gfSpawned = false; S.kidsGrown = false;
+    S.dmg = 1 + (S.dmg - 1) * .5;               // 능력 일부 계승
+    S.fireInt = BAL.fireInterval - (BAL.fireInterval - S.fireInt) * .5;
+    S.invuln = 2.5;
+    S.mobs = []; S.gates = [];
+    banner(`${S.gen}세대 시작`, '아이가 달리기를 이어받는다');
+  } else {                      // 가문 종료
+    S.chronicle += Math.floor(S.age);
+    S.mode = 'over'; S.overT = 0;
+    if (S.chronicle > best) { best = S.chronicle; try { localStorage.setItem('warlord-poc-best', String(best)); } catch (e) {} }
+  }
+}
+
+// ───────────────────────── 업데이트 ─────────────────────────
+function update(dt) {
+  S.scroll = (S.scroll + scrollSpd() * dt) % 48;
+  S.shake = Math.max(0, S.shake - dt * 26);
+  S.parts = S.parts.filter(p => (p.x += p.vx * dt, p.y += p.vy * dt, (p.life -= dt) > 0));
+  S.labels = S.labels.filter(l => (l.y -= 34 * dt, (l.life -= dt) > 0));
+  if (S.banner && (S.banner.life -= dt) <= 0) S.banner = null;
+  if (S.mode === 'over') { S.overT += dt; return; }
+
+  S.invuln = Math.max(0, S.invuln - dt);
+  S.hintT = Math.max(0, S.hintT - dt);
+
+  // 이동
+  let dir = 0;
+  if (keys.has('ArrowLeft') || keys.has('a')) dir--;
+  if (keys.has('ArrowRight') || keys.has('d')) dir++;
+  if (dir) S.targetX = clamp(S.targetX + dir * 330 * dt, ROAD_L + 16, ROAD_R - 16);
+  S.targetX = clamp(S.targetX, ROAD_L + 16, ROAD_R - 16);
+  S.leaderX += (S.targetX - S.leaderX) * Math.min(1, dt * 12);
+
+  // 나이 (보스전 중 정지)
+  if (S.mode === 'play') {
+    S.age += BAL.yearsPerSec * dt;
+    if (S.age >= BAL.lifespan) { S.invuln = 0; banner('천수를 누렸다', '수명 — 다음 세대로'); leaderHit(); return; }
+    const nb = BOSSES[S.bossIdx];
+    if (nb && S.age >= nb.age) startBoss(nb);
+  }
+
+  // 일제사격
+  S.fireT -= dt;
+  if (S.fireT <= 0) {
+    S.fireT = S.fireInt;
+    const pts = [{ x: S.leaderX, y: LEADER_Y - 14 }];
+    for (let i = 0; i < S.crowd; i++)
+      pts.push({ x: clamp(S.leaderX + FORM[i].x, ROAD_L + 8, ROAD_R - 8), y: LEADER_Y + FORM[i].y - 12 });
+    for (const p of pts) S.missiles.push({ x: p.x, y: p.y, dmg: S.dmg, c: '#f2c14e' });
+  }
+  if (S.hasGF && (S.gfFireT -= dt) <= 0) {
+    S.gfFireT = .5;
+    S.missiles.push({ x: S.leaderX + 26, y: LEADER_Y - 6, dmg: S.isWife ? S.dmg * 2 : S.dmg, c: '#e87f9a' });
+  }
+  if (S.babies > 0 && (S.babyFireT -= dt) <= 0) {
+    S.babyFireT = S.kidsGrown ? .4 : .75;
+    for (let i = 0; i < S.babies; i++)
+      S.missiles.push({ x: S.leaderX - 26 - i * 20, y: LEADER_Y + 4, dmg: S.kidsGrown ? S.dmg * 1.5 : S.dmg * .7, c: '#9ce09a' });
+  }
+  S.missiles = S.missiles.filter(m => (m.y -= BAL.missileSpeed * dt, m.y > -20 && !m.hit));
+
+  // 스폰
+  if (S.mode === 'play') {
+    if ((S.barrelT -= dt) <= 0) { S.barrelT = Math.max(BAL.barrelEvery[1], BAL.barrelEvery[0] - threat() * .02); spawnBarrel(); }
+    if ((S.runnerT -= dt) <= 0) { S.runnerT = BAL.runnerEvery; spawnRunners(); }
+    if ((S.gateT -= dt) <= 0) { S.gateT = BAL.gateEvery; spawnGate(); }
+    if (!S.gfSpawned && !S.hasGF && S.age >= 23) spawnCapsule();
+  }
+
+  // 보스
+  if (S.boss) {
+    const b = S.boss;
+    b.x += b.vx * dt;
+    if (b.x < ROAD_L + b.r || b.x > ROAD_R - b.r) b.vx *= -1;
+    b.y += b.sink * dt;
+    if ((S.bossSpitT -= dt) <= 0) {       // 서류 투척
+      S.bossSpitT = 2.2;
+      for (let i = 0; i < 2; i++)
+        S.mobs.push({ kind: 'paper', x: b.x + rnd(-30, 30), y: b.y + 30, r: 9, hp: 1, max: 1,
+          vy: scrollSpd() * 1.15 + 60, spin: rnd(0, 6) });
+    }
+    if (b.y + b.r > LEADER_Y - 24) { leaderHit(); if (S.boss) S.boss.y = 90; }
+  }
+
+  // 몹 이동/충돌
+  for (const m of S.mobs) {
+    m.y += m.vy * dt;
+    if (m.kind === 'runner') m.x += (S.leaderX - m.x) * .22 * dt;
+    if (m.spin != null) m.spin += 5 * dt;
+  }
+  for (const m of S.missiles) {
+    if (S.boss) {
+      const b = S.boss, dx = m.x - b.x, dy = m.y - b.y;
+      if (dx * dx + dy * dy < (b.r + 4) * (b.r + 4)) {
+        m.hit = true; b.hp -= m.dmg; boom(m.x, m.y, '#f2c14e', 2);
+        if (b.hp <= 0) {
+          boom(b.x, b.y, '#f2c14e', 40); S.shake = 7;
+          const rb = S.boss; S.boss = null; S.mode = 'play'; S.bossIdx++;
+          reward(rb);
+        }
+        continue;
+      }
+    }
+    for (const t of S.mobs) {
+      if (t.hp <= 0 || t.kind === 'capsule') continue;
+      const dx = m.x - t.x, dy = m.y - t.y, rr = t.r + 4;
+      if (dx * dx + dy * dy < rr * rr) {
+        m.hit = true; t.hp -= m.dmg;
+        if (t.hp <= 0) boom(t.x, t.y, t.kind === 'barrel' ? '#d98c4a' : '#e0524a', t.kind === 'barrel' ? 14 : 8);
+        else boom(m.x, m.y, '#f2c14e', 1);
+        break;
+      }
+    }
+  }
+  S.missiles = S.missiles.filter(m => !m.hit);
+
+  // 몹 vs 부대 / 화면 이탈
+  for (const m of S.mobs) {
+    if (m.hp <= 0) continue;
+    if (m.y > LEADER_Y - 20 && Math.abs(m.x - S.leaderX) < m.r + 16) {
+      if (m.kind === 'capsule') {
+        m.hp = 0; S.hasGF = true; boom(m.x, m.y, '#e87f9a', 16);
+        banner('여자친구 합류!', '함께 달린다'); continue;
+      }
+      m.hp = 0; boom(m.x, m.y, '#e0524a', 10); S.shake = Math.max(S.shake, 4);
+      const cost = m.kind === 'barrel' ? Math.max(2, Math.ceil(m.max / 8)) : 1;
+      if (S.invuln <= 0) {
+        if (S.crowd >= cost) { S.crowd -= cost; label(S.leaderX, LEADER_Y - 30, `분신 -${cost}`, '#e88a84'); }
+        else if (S.crowd > 0) { S.crowd = 0; label(S.leaderX, LEADER_Y - 30, '분신 전멸!', '#e88a84'); }
+        else leaderHit();
+      }
+    }
+  }
+  S.mobs = S.mobs.filter(m => m.hp > 0 && m.y < H + 40);
+
+  // 게이트
+  for (const g of S.gates) {
+    g.y += scrollSpd() * .62 * dt;
+    if (!g.done && g.y > LEADER_Y - 10) {
+      g.done = true;
+      const side = S.leaderX < W / 2 ? g.left : g.right;
+      const before = S.crowd;
+      S.crowd = clamp(S.crowd + side.v, 0, BAL.crowdCap);
+      const d = S.crowd - before;
+      label(S.leaderX, LEADER_Y - 34, d >= 0 ? `복제 +${d}` : `복제 ${d}`, d >= 0 ? '#9cc2ff' : '#e88a84');
+      boom(S.leaderX, LEADER_Y, d >= 0 ? '#9cc2ff' : '#e0524a', 12);
+    }
+  }
+  S.gates = S.gates.filter(g => g.y < H + 40);
+}
+
+// ───────────────────────── 그리기 ─────────────────────────
+function runner(x, y, s, body, skin, hair, ghost) {
+  cx.globalAlpha = ghost ? .62 : 1;
+  cx.fillStyle = body;
+  cx.beginPath(); cx.ellipse(x, y + 4 * s, 9.5 * s, 7 * s, 0, 0, 7); cx.fill();
+  cx.fillStyle = skin;
+  cx.beginPath(); cx.arc(x, y - 4 * s, 5.8 * s, 0, 7); cx.fill();
+  cx.fillStyle = hair;
+  cx.beginPath(); cx.ellipse(x, y - 6.4 * s, 5.4 * s, 3.4 * s, 0, Math.PI, 0); cx.fill();
+  cx.globalAlpha = 1;
+}
+function drawRoad() {
+  cx.fillStyle = '#131e36'; cx.fillRect(0, 0, W, H);            // 물
+  cx.fillStyle = 'rgba(255,255,255,.05)';
+  for (let i = 0; i < 6; i++) cx.fillRect((i * 67 + S.scroll * 2) % W, (i * 113 + S.scroll) % H, 14, 2);
+  cx.fillStyle = '#7e8797'; cx.fillRect(ROAD_L - 20, 0, 20, H); cx.fillRect(ROAD_R, 0, 20, H); // 난간
+  cx.strokeStyle = '#5c6575'; cx.lineWidth = 3;
+  for (let y = (S.scroll % 48) - 48; y < H; y += 48) {
+    cx.beginPath(); cx.moveTo(ROAD_L - 20, y); cx.lineTo(ROAD_L, y);
+    cx.moveTo(ROAD_R, y + 24); cx.lineTo(ROAD_R + 20, y + 24); cx.stroke();
+  }
+  cx.fillStyle = '#717a89'; cx.fillRect(ROAD_L, 0, ROAD_R - ROAD_L, H);   // 도로
+  cx.fillStyle = '#7d8695';
+  for (let i = 0; i < 7; i++) {
+    const yy = (i * 131 + S.scroll * 3) % (H + 60) - 30;
+    cx.beginPath(); cx.roundRect(ROAD_L + 20 + (i * 53) % (ROAD_R - ROAD_L - 70), yy, 30 + (i % 3) * 8, 13, 6); cx.fill();
+  }
+}
+function draw(time) {
+  cx.save();
+  if (S.shake > 0) cx.translate(rnd(-S.shake, S.shake) * .5, rnd(-S.shake, S.shake) * .5);
+  drawRoad();
+
+  // 게이트
+  for (const g of S.gates) {
+    const halfW = (ROAD_R - ROAD_L) / 2 - 10;
+    for (const [side, gx] of [[g.left, ROAD_L + 5], [g.right, W / 2 + 5]]) {
+      cx.fillStyle = side.neg ? 'rgba(224,82,74,.30)' : 'rgba(122,170,255,.30)';
+      cx.strokeStyle = side.neg ? '#e88a84' : '#9cc2ff'; cx.lineWidth = 2.5;
+      cx.beginPath(); cx.roundRect(gx, g.y - 22, halfW, 44, 9); cx.fill(); cx.stroke();
+      cx.fillStyle = '#eaf2ff'; cx.font = `700 20px ${FONT}`; cx.textAlign = 'center';
+      cx.fillText((side.v > 0 ? '+' : '') + side.v, gx + halfW / 2, g.y + 7);
+    }
+  }
+
+  // 몹
+  for (const m of S.mobs) {
+    if (m.kind === 'barrel') {
+      cx.fillStyle = '#a8683c'; cx.strokeStyle = '#6b4526'; cx.lineWidth = 2.5;
+      cx.beginPath(); cx.arc(m.x, m.y, m.r, 0, 7); cx.fill(); cx.stroke();
+      cx.strokeStyle = '#4c4a48'; cx.lineWidth = 3;
+      cx.beginPath(); cx.moveTo(m.x - m.r, m.y - 6); cx.lineTo(m.x + m.r, m.y - 6);
+      cx.moveTo(m.x - m.r, m.y + 6); cx.lineTo(m.x + m.r, m.y + 6); cx.stroke();
+      cx.fillStyle = '#3a3b40';
+      cx.beginPath(); cx.roundRect(m.x - 14, m.y - 10, 28, 20, 5); cx.fill();
+      cx.fillStyle = '#fff'; cx.font = `700 13px ${MONO}`; cx.textAlign = 'center';
+      cx.fillText(Math.ceil(m.hp), m.x, m.y + 5);
+      cx.fillStyle = 'rgba(233,237,246,.85)'; cx.font = `600 10px ${FONT}`;
+      cx.fillText(m.word, m.x, m.y + m.r + 13);
+    } else if (m.kind === 'runner') {
+      runner(m.x, m.y, 1, '#a93c34', '#d9a184', '#241a14');
+    } else if (m.kind === 'paper') {
+      cx.save(); cx.translate(m.x, m.y); cx.rotate(m.spin);
+      cx.fillStyle = '#e9edf6'; cx.fillRect(-6, -8, 12, 16);
+      cx.strokeStyle = '#9aa4b8'; cx.lineWidth = 1;
+      cx.beginPath(); cx.moveTo(-3, -4); cx.lineTo(3, -4); cx.moveTo(-3, 0); cx.lineTo(3, 0); cx.stroke();
+      cx.restore();
+    } else if (m.kind === 'capsule') {
+      cx.fillStyle = 'rgba(140,190,255,.25)'; cx.strokeStyle = '#9cc2ff'; cx.lineWidth = 2.5;
+      cx.beginPath(); cx.roundRect(m.x - 24, m.y - 18, 48, 36, 16); cx.fill(); cx.stroke();
+      runner(m.x, m.y, .9, '#e87f9a', '#f2cda9', '#4a3226');
+      cx.strokeStyle = '#f2c14e'; cx.setLineDash([4, 5]);
+      cx.beginPath(); cx.arc(m.x, m.y, 28, 0, 7); cx.stroke(); cx.setLineDash([]);
+      cx.fillStyle = '#f2c14e'; cx.font = `700 10px ${FONT}`; cx.textAlign = 'center';
+      cx.fillText('깨우기', m.x, m.y + 42);
+    }
+  }
+
+  // 보스
+  if (S.boss) {
+    const b = S.boss, s = b.r / 24;
+    cx.fillStyle = '#2e3442';
+    cx.beginPath(); cx.ellipse(b.x, b.y + 10 * s, 26 * s, 18 * s, 0, 0, 7); cx.fill();
+    cx.fillStyle = '#c8493f';
+    cx.beginPath(); cx.moveTo(b.x, b.y); cx.lineTo(b.x + 6 * s, b.y + 13 * s); cx.lineTo(b.x, b.y + 22 * s); cx.lineTo(b.x - 6 * s, b.y + 13 * s); cx.fill();
+    cx.fillStyle = '#e8c39d';
+    cx.beginPath(); cx.arc(b.x, b.y - 9 * s, 12 * s, 0, 7); cx.fill();
+    cx.fillStyle = '#2a2019';
+    cx.beginPath(); cx.ellipse(b.x, b.y - 14 * s, 11 * s, 6 * s, 0, Math.PI, 0); cx.fill();
+    cx.strokeStyle = '#1c232f'; cx.lineWidth = 2.5;
+    cx.beginPath(); cx.moveTo(b.x - 8 * s, b.y - 10 * s); cx.lineTo(b.x - 2 * s, b.y - 10 * s);
+    cx.moveTo(b.x + 2 * s, b.y - 10 * s); cx.lineTo(b.x + 8 * s, b.y - 10 * s); cx.stroke();
+    // HP 바
+    cx.fillStyle = '#3a1d22'; cx.beginPath(); cx.roundRect(60, 46, 240, 15, 7.5); cx.fill();
+    cx.fillStyle = '#e0524a'; cx.beginPath(); cx.roundRect(60, 46, 240 * Math.max(0, b.hp / b.maxHp), 15, 7.5); cx.fill();
+    cx.fillStyle = '#fff'; cx.font = `700 11px ${FONT}`; cx.textAlign = 'center';
+    cx.fillText(`보스 · ${b.name}`, W / 2, 58);
+  }
+
+  // 미사일
+  for (const m of S.missiles) {
+    cx.fillStyle = m.c; cx.globalAlpha = .45;
+    cx.fillRect(m.x - 1.4, m.y, 2.8, 10); cx.globalAlpha = 1;
+    cx.beginPath(); cx.moveTo(m.x, m.y - 8); cx.lineTo(m.x + 3, m.y + .5); cx.lineTo(m.x, m.y - 1); cx.lineTo(m.x - 3, m.y + .5); cx.fill();
+  }
+
+  // 부대
+  const blink = S.invuln > 0 && Math.floor(time * 9) % 2 === 0;
+  for (let i = 0; i < S.crowd; i++) {
+    const f = FORM[i];
+    runner(clamp(S.leaderX + f.x, ROAD_L + 8, ROAD_R - 8), LEADER_Y + f.y, .92, '#4a7de6', '#f0c9a0', '#33251b', true);
+  }
+  for (let i = 0; i < S.babies; i++) {
+    const bx = S.leaderX - 26 - i * 20, by = LEADER_Y + 8;
+    if (S.kidsGrown) runner(bx, by, .8, '#58b0e6', '#f0c9a0', '#33251b');
+    else {
+      cx.fillStyle = '#efe9db'; cx.strokeStyle = '#bdb49f'; cx.lineWidth = 1.5;
+      cx.beginPath(); cx.roundRect(bx - 8, by - 11, 16, 22, 7); cx.fill(); cx.stroke();
+      cx.fillStyle = '#f6d7b3'; cx.beginPath(); cx.arc(bx, by - 3, 4, 0, 7); cx.fill();
+    }
+  }
+  if (S.hasGF) {
+    runner(S.leaderX + 26, LEADER_Y + 6, .95, '#e87f9a', '#f2cda9', '#4a3226');
+    if (S.isWife) { cx.strokeStyle = '#f2c14e'; cx.lineWidth = 2; cx.beginPath(); cx.arc(S.leaderX + 26, LEADER_Y + 6, 13, 0, 7); cx.stroke(); }
+  }
+  if (!blink) {
+    cx.strokeStyle = '#f2c14e'; cx.lineWidth = 2.2;
+    cx.beginPath(); cx.arc(S.leaderX, LEADER_Y, 14, 0, 7); cx.stroke();
+    runner(S.leaderX, LEADER_Y, 1.05, '#4a7de6', '#f0c9a0', '#33251b');
+  }
+  // 부대 수 배지 (본체 머리 위)
+  cx.fillStyle = 'rgba(8,13,26,.6)'; cx.beginPath(); cx.roundRect(S.leaderX - 20, LEADER_Y - 46, 40, 19, 9.5); cx.fill();
+  cx.fillStyle = '#fff'; cx.font = `700 12px ${MONO}`; cx.textAlign = 'center';
+  cx.fillText('x' + unitCount(), S.leaderX, LEADER_Y - 32);
+
+  // 파티클/라벨
+  for (const p of S.parts) {
+    cx.globalAlpha = p.life / p.max; cx.fillStyle = p.color;
+    cx.beginPath(); cx.arc(p.x, p.y, p.r, 0, 7); cx.fill();
+  }
+  cx.globalAlpha = 1;
+  for (const l of S.labels) {
+    cx.globalAlpha = Math.min(1, l.life * 2); cx.fillStyle = l.color;
+    cx.font = `700 14px ${FONT}`; cx.textAlign = 'center'; cx.fillText(l.text, l.x, l.y);
+  }
+  cx.globalAlpha = 1;
+  cx.restore();
+
+  // ── HUD ──
+  cx.fillStyle = 'rgba(8,13,26,.55)'; cx.beginPath(); cx.roundRect(10, 10, 118, 44, 10); cx.fill();
+  cx.fillStyle = '#fff'; cx.font = `700 20px ${MONO}`; cx.textAlign = 'left';
+  cx.fillText(`${Math.floor(S.age)}세`, 20, 30);
+  cx.fillStyle = '#98a4be'; cx.font = `600 10.5px ${FONT}`;
+  cx.fillText(`${S.gen}세대 · 연대기 ${S.chronicle + Math.floor(S.age)}년`, 20, 46);
+  cx.fillStyle = 'rgba(8,13,26,.55)'; cx.beginPath(); cx.roundRect(W - 92, 10, 82, 24, 10); cx.fill();
+  cx.fillStyle = '#f2c14e'; cx.font = `700 11px ${MONO}`; cx.textAlign = 'right';
+  cx.fillText(`BEST ${best}년`, W - 18, 26);
+
+  if (S.hintT > 0 && S.mode !== 'over') {
+    cx.globalAlpha = Math.min(1, S.hintT);
+    cx.fillStyle = '#cfd8ea'; cx.font = `600 13px ${FONT}`; cx.textAlign = 'center';
+    cx.fillText('드래그(또는 ← →)로 이동 · 발사는 자동', W / 2, H - 26);
+    cx.globalAlpha = 1;
+  }
+
+  // 배너
+  if (S.banner) {
+    const a = Math.min(1, S.banner.life * 2.5);
+    cx.globalAlpha = a;
+    cx.fillStyle = 'rgba(8,13,26,.55)'; cx.beginPath(); cx.roundRect(40, 180, W - 80, 64, 12); cx.fill();
+    cx.fillStyle = '#f2c14e'; cx.font = `800 22px ${FONT}`; cx.textAlign = 'center';
+    cx.fillText(S.banner.t, W / 2, 208);
+    cx.fillStyle = '#e9edf6'; cx.font = `600 12.5px ${FONT}`;
+    cx.fillText(S.banner.sub, W / 2, 230);
+    cx.globalAlpha = 1;
+  }
+
+  // 게임 오버
+  if (S.mode === 'over') {
+    cx.fillStyle = 'rgba(5,8,16,.78)'; cx.fillRect(0, 0, W, H);
+    cx.textAlign = 'center';
+    cx.fillStyle = '#e0524a'; cx.font = `800 34px ${FONT}`;
+    cx.fillText('가문 종료', W / 2, 230);
+    cx.fillStyle = '#fff'; cx.font = `700 24px ${FONT}`;
+    cx.fillText(`가문 연대기 ${S.chronicle}년`, W / 2, 280);
+    cx.fillStyle = '#98a4be'; cx.font = `600 14px ${FONT}`;
+    cx.fillText(`${S.gen}세대 · BEST ${best}년`, W / 2, 308);
+    if (S.overT > 0.8 && Math.floor(time * 2) % 2 === 0) {
+      cx.fillStyle = '#f2c14e'; cx.font = `700 15px ${FONT}`;
+      cx.fillText('탭하면 다시 태어납니다', W / 2, 370);
+    }
+  }
+}
+
+// ───────────────────────── 루프 ─────────────────────────
+function boot() {
+  resetAll();
+  let last = performance.now();
+  const frame = now => {
+    const dt = Math.min((now - last) / 1000, .05);
+    last = now;
+    update(dt);
+    draw(now / 1000);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+window.claude?.hot?.ready ? window.claude.hot.ready(boot) : boot();
+</script>
+
+</html>
